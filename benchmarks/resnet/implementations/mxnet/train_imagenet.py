@@ -148,11 +148,12 @@ if __name__ == '__main__':
 
     args.local_rank = None
 
+    kv = None
+    # initialize Horovod with mpi4py comm
+    hvd.init(mpiwrapper._get_comm())
+    # args.gpus = _get_gpu(args.gpus)
+
     if 'horovod' in args.kv_store:
-        # initialize Horovod with mpi4py comm
-        hvd.init(mpiwrapper._get_comm())
-        args.gpus = _get_gpu(args.gpus)
-        kv = None
         local_rank = hvd.local_rank()
         args.local_rank = local_rank
 
@@ -167,14 +168,7 @@ if __name__ == '__main__':
         summed2 = hvd.allreduce(tensor2, average=False)
 
     framework = 'MxNet NGC {}'.format(os.environ["NVIDIA_MXNET_VERSION"])
-    # DISABLE FOR NOW. CAUSES CRASHES.
-    #mlperf_submission_log(
-    #    benchmark=mlperf_constants.RESNET,
-    #    framework=framework,
-    #)
 
-    
-    
     # Load network
     from importlib import import_module
     net = import_module('symbols.'+args.network)
@@ -191,14 +185,14 @@ if __name__ == '__main__':
     else:
         kv = mx.kvstore.create(args.kv_store)
 
-    
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     mx.random.seed(args.seed)
 
     # Devices for training
     devs = mx.cpu() if args.gpus is None or args.gpus == "" else [
-       mx.gpu(int(i)) for i in args.gpus.split(',')]
+        mx.gpu(int(i)) for i in args.gpus.split(',')]
 
     # Load symbol definiton and create model
     sym = net.get_symbol(**vars(args))
@@ -207,7 +201,7 @@ if __name__ == '__main__':
 
     # Weights init
     initializer = MLPerfInit(
-                        rnd_type='gaussian', factor_type="in", magnitude=2) if not args.bn_gamma_init0 else BNZeroInit(rnd_type='gaussian', factor_type="in", magnitude=2)
+        rnd_type='gaussian', factor_type="in", magnitude=2) if not args.bn_gamma_init0 else BNZeroInit(rnd_type='gaussian', factor_type="in", magnitude=2)
 
     # Set DALI pipeline up
     if not args.use_dali:
@@ -215,29 +209,28 @@ if __name__ == '__main__':
     else:
         lambda_fnc_dali_get_rec_iter=dali.build_input_pipeline(args, kv)
 
-    arg_params, aux_params = None, None
+    # Create dummy data shapes and bind them to the model
+    data_shapes = [mx.io.DataDesc('data', (args.batch_size, 224, 224, 4), 'float16')]
+    label_shapes = [mx.io.DataDesc('softmax_label', (args.batch_size,), 'float32')]
+    model.bind(data_shapes=data_shapes, label_shapes=label_shapes)
+
+    # Horovod: fetch and broadcast parameters
+    mx.ndarray.waitall()
+    model.init_params(initializer)
+    mx.ndarray.waitall()
+    mx.ndarray.waitall()
+    (arg_params, aux_params) = model.get_params()
 
     # Model fetch and broadcast
     if 'horovod' in args.kv_store:
-        # Create dummy data shapes and bind them to the model
-        data_shapes  = [mx.io.DataDesc('data',(args.batch_size, 224, 224, 4),'float16')]
-        label_shapes = [mx.io.DataDesc('softmax_label',(args.batch_size,),'float32')]
-        model.bind(data_shapes=data_shapes, label_shapes=label_shapes)
-
-        # Horovod: fetch and broadcast parameters
-        mx.ndarray.waitall()
-        model.init_params(initializer, arg_params=arg_params, aux_params=aux_params)
-        mx.ndarray.waitall()
-        mx.ndarray.waitall()
-        (arg_params, aux_params) = model.get_params()
         if arg_params is not None:
             hvd.broadcast_parameters(arg_params, root_rank=0)
 
         if aux_params is not None:
             hvd.broadcast_parameters(aux_params, root_rank=0)
 
-        mx.ndarray.waitall()
-        model.set_params(arg_params=arg_params, aux_params=aux_params)
+    mx.ndarray.waitall()
+    model.set_params(arg_params=arg_params, aux_params=aux_params)
 
     mx.ndarray.waitall()
 
